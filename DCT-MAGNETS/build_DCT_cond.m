@@ -1,7 +1,6 @@
- % =========================================================================
+% =========================================================================
 % 脚本: Build_DCT_cond_Symmetric_v2.m
-% 目的: 将 DCT 路径转换为 .cond 文件 (支持 BR8/BR20 + 自动对称驱动)
-% 修复: 找回丢失的 BR8 支持
+% 目的: 将 DCT 路径转换为 .cond 文件 (支持 BR8/BR20 brick+ 自动计算配置不同极面电流驱动)
 % =========================================================================
 
 %% 1. 初始化环境
@@ -24,11 +23,11 @@ options.coil_radius = 1;     % 圆半径 mm
 
 % --- 电学参数 ---
 options.current        = 500;  % 单根导线电流 (A)
-options.symmetry_index = 1;    % 材料索引
+options.symmetry_index = 1;    % opera symmetry index
 
 % --- 文件路径 ---
-options.input_dir = 'dct_se3_output'; 
-options.output_dir = 'SUPER_DCT_cond';  
+options.input_dir = 'dct_output'; 
+options.output_dir = 'DCT_cond';  
 if ~exist(options.output_dir, 'dir'), mkdir(options.output_dir); end
 
 output_filename = sprintf('FDCT_Symmetric_m%d_%s1.cond', options.multipole_order, options.element_type);
