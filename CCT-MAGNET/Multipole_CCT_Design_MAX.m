@@ -167,158 +167,118 @@ fprintf('║       含弯曲拟多边形CCT功能             ║\n');
 fprintf('╚════════════════════════════════════════╝\n\n');
 
 %% ==================== 核心TNB计算函数 ====================
-
-% --- 专业版TNB计算函数 (使用旋转最小化标架RMF) ---
 function full_path_data = calculate_tnb_frames_pro(path_xyz, show_progress)
-    % 使用旋转最小化标架(RMF)方法计算TNB标架
-    % 输入: path_xyz - N x 3 矩阵，每行为[X, Y, Z]坐标（单位：毫米）
-    %       show_progress - 是否显示进度
-    % 输出: full_path_data - N x 12 矩阵 [X, Y, Z, Tx, Ty, Tz, Nx, Ny, Nz, Bx, By, Bz]
+    % 该算法确保法向矢量严格指向骨架外侧，防止OPERA中导体发生扭转和躺平
     
-    % 如果没有提供第二个参数，默认不显示进度
     if nargin < 2
         show_progress = false;
     end
     
-    % 输入验证
-    if size(path_xyz, 2) ~= 3 % 检查输入是否为3列（X,Y,Z）
-        error('输入矩阵 path_xyz 必须是 N x 3 的格式。');
-    end
-    num_pts = size(path_xyz, 1); % 获取路径点的总数量
-    if num_pts < 3 % 至少需要3个点才能计算标架
+    num_pts = size(path_xyz, 1);
+    if num_pts < 3
         error('输入路径至少需要3个点才能计算TNB标架。');
     end
 
-    % 如果需要显示进度，打印进度信息
     if show_progress
-        fprintf('  计算TNB标架 (RMF算法): ');
+        fprintf('  计算TNB标架 (表面几何对齐算法): ');
     end
 
-    % 计算切向矢量 (使用中心差分法)
-    tangents = zeros(num_pts, 3); % 初始化切向矢量矩阵
-    tangents(2:end-1, :) = path_xyz(3:end, :) - path_xyz(1:end-2, :); % 中间点使用中心差分
-    tangents(1, :) = path_xyz(2, :) - path_xyz(1, :); % 起始点使用前向差分
-    tangents(end, :) = path_xyz(end, :) - path_xyz(end-1, :); % 终点使用后向差分
-    tangents = tangents ./ vecnorm(tangents, 2, 2); % 归一化所有切向矢量
+    % 1. 计算切向矢量 T (中心差分法)
+    tangents = zeros(num_pts, 3);
+    tangents(2:end-1, :) = path_xyz(3:end, :) - path_xyz(1:end-2, :);
+    tangents(1, :) = path_xyz(2, :) - path_xyz(1, :);
+    tangents(end, :) = path_xyz(end, :) - path_xyz(end-1, :);
+    tangents = tangents ./ vecnorm(tangents, 2, 2);
 
-    % 使用RMF计算法向矢量
-    normals = zeros(num_pts, 3); % 初始化法向矢量矩阵
-    
-    % 初始化第一个法向矢量
-    t1 = tangents(1, :); % 获取第一个切向矢量
-    ref_vec = [0, 0, 1]; % 优先使用Z轴作为参考矢量
-    if abs(dot(t1, ref_vec)) > 0.99 % 如果切线几乎与Z轴平行
-        ref_vec = [0, 1, 0]; % 切换到Y轴作为参考
+    % 2. 使用调用栈智能识别当前正在生成的线圈类型
+    st = dbstack;
+    if length(st) > 1
+        caller = st(2).name; % 获取调用该函数的上级生成函数名
+    else
+        caller = 'linear'; 
     end
+    is_curved = contains(caller, 'curved') || contains(caller, 'bent');
+
+    % 3. 计算几何参考法向 N_ref (始终由骨架中心指向外侧)
+    N_ref = zeros(num_pts, 3);
     
-    % 格拉姆-施密特正交化过程，生成与切向垂直的法向
-    n1_unnormalized = ref_vec - dot(ref_vec, t1) * t1;
-    normals(1, :) = n1_unnormalized / norm(n1_unnormalized); % 归一化
-    
-    % 迭代计算所有点的法向矢量（使用平行传输）
-    progress_step = max(1, floor(num_pts / 20)); % 计算进度显示步长
-    for i = 2:num_pts % 从第二个点开始迭代
-        if show_progress && mod(i, progress_step) == 0 % 显示进度点
-            fprintf('.');
+    if ~is_curved
+        % === 直线型线圈 === (沿Z轴绕制，中心轴为Z轴)
+        N_ref = [path_xyz(:, 1), path_xyz(:, 2), zeros(num_pts, 1)];
+    else
+        % === 弯曲型线圈 === (沿圆环绕制，需要动态获取环芯坐标)
+        Rc = 250; bend_axis = 'Y'; % 设置默认后备参数
+        try
+            % 跨工作区尝试获取具体的弯曲参数
+            if contains(caller, 'circular')
+                p = evalin('base', 'CIRCULAR_PARAMS');
+                Rc = p.Rc; bend_axis = p.bend_axis;
+            elseif contains(caller, 'elliptic')
+                p = evalin('base', 'ELLIPTIC_PARAMS');
+                Rc = p.Rc; bend_axis = 'Y';
+            elseif contains(caller, 'poly')
+                p = evalin('base', 'BENT_POLY_PARAMS');
+                Rc = p.R_bend; bend_axis = 'Y';
+            end
+        catch
+            % 若抓取失败，保持后备参数
         end
         
-        t_prev = tangents(i-1, :); % 前一个点的切向
-        n_prev = normals(i-1, :);  % 前一个点的法向
-        t_curr = tangents(i, :);   % 当前点的切向
-        
-        % 计算旋转轴（两个切向的叉积）
-        rotation_vec = cross(t_prev, t_curr);
-        
-        if norm(rotation_vec) < 1e-12 % 如果切线方向几乎没有变化
-            normals(i, :) = n_prev; % 直接复制前一个法向
+        if upper(bend_axis) == 'Y'
+            % 绕Y轴弯曲，骨架中心线在XZ平面内
+            xz_norm = sqrt(path_xyz(:,1).^2 + path_xyz(:,3).^2);
+            core_x = path_xyz(:,1) .* (Rc ./ xz_norm);
+            core_z = path_xyz(:,3) .* (Rc ./ xz_norm);
+            N_ref = [path_xyz(:,1) - core_x, path_xyz(:,2), path_xyz(:,3) - core_z];
         else
-            % 使用Rodrigues旋转公式进行平行传输
-            cos_angle = dot(t_prev, t_curr); % 两切向夹角的余弦
-            sin_angle = norm(rotation_vec);  % 两切向夹角的正弦
-            rotation_vec = rotation_vec / sin_angle; % 归一化旋转轴
-            
-            % 构建旋转矩阵（Rodrigues公式）
-            K = [0, -rotation_vec(3), rotation_vec(2);     % 反对称矩阵
-                 rotation_vec(3), 0, -rotation_vec(1);
-                 -rotation_vec(2), rotation_vec(1), 0];
-            R = eye(3) + sin_angle * K + (1 - cos_angle) * K^2; % 旋转矩阵
-            normals(i, :) = (R * n_prev')'; % 应用旋转得到新的法向
+            % 绕Z轴弯曲，骨架中心线在XY平面内
+            xy_norm = sqrt(path_xyz(:,1).^2 + path_xyz(:,2).^2);
+            core_x = path_xyz(:,1) .* (Rc ./ xy_norm);
+            core_y = path_xyz(:,2) .* (Rc ./ xy_norm);
+            N_ref = [path_xyz(:,1) - core_x, path_xyz(:,2) - core_y, path_xyz(:,3)];
         end
     end
 
-    % 计算副法向矢量（切向与法向的叉积）
-    binormals = cross(tangents, normals, 2);
+    % 4. 计算最终严格正交的法向 N 和副法向 B
+    normals = zeros(num_pts, 3);
+    binormals = zeros(num_pts, 3);
+    progress_step = max(1, floor(num_pts / 20));
     
-    if show_progress
-        fprintf(' 完成\n');
-    end
-    
-    % 组合输出数据：坐标 + TNB标架
-    full_path_data = [path_xyz, tangents, normals, binormals];
-end
-
-% --- 简化版TNB计算函数 ---
-function tnb_data = calculate_tnb_frames_v1(xyz_coords, show_progress)
-    % 简化版TNB计算（使用数值差分）
-    if nargin < 2 % 如果没有提供第二个参数
-        show_progress = false;
-    end
-    
-    if show_progress
-        fprintf('  计算TNB标架 (简化算法): ');
-    end
-    
-    num_pts = size(xyz_coords, 1); % 获取点的数量
-    tangents = zeros(num_pts, 3);  % 初始化切向矢量
-    normals = zeros(num_pts, 3);   % 初始化法向矢量
-    binormals = zeros(num_pts, 3); % 初始化副法向矢量
-    
-    % 使用梯度计算速度矢量
-    velocity = gradient(xyz_coords')'; % 计算各方向的梯度作为速度
-    
-    progress_step = max(1, floor(num_pts / 20)); % 进度显示步长
     for i = 1:num_pts
-        if show_progress && mod(i, progress_step) == 0 % 显示进度
+        if show_progress && mod(i, progress_step) == 0
             fprintf('.');
         end
         
-        % 计算切向矢量
-        T = velocity(i, :); % 获取当前点的速度矢量
-        if norm(T) < 1e-9  % 如果速度几乎为零
-            T = [1 0 0];    % 使用默认切向
-        else
-            T = T / norm(T); % 归一化得到单位切向
-        end
-        tangents(i, :) = T;
+        T = tangents(i, :);
+        ref = N_ref(i, :);
+        ref_norm = norm(ref);
         
-        % 选择参考矢量（指向原点的径向）
-        ref_vec = -[xyz_coords(i,1), xyz_coords(i,2), 0]; % XY平面上指向原点
-        if norm(ref_vec) < 1e-9 % 如果在原点附近
-            ref_vec = [0, 0, -1]; % 使用负Z方向
-        end
-        if abs(dot(T, ref_vec/norm(ref_vec))) > 0.999 % 如果几乎平行
-            ref_vec = [1, 0, 0]; % 切换到X方向
+        if ref_norm < 1e-9
+            ref = [1, 0, 0]; % 防零除保护
+        else
+            ref = ref / ref_norm;
         end
         
-        % 计算法向矢量
-        N_un = ref_vec - dot(ref_vec, T) * T; % 正交化
-        if norm(N_un) < 1e-9 % 如果正交化后太小
-            N = cross(T, [0 0 1]); % 使用切向与Z轴的叉积
+        % 格拉姆-施密特正交化：确保法向与切向严格垂直
+        N_un = ref - dot(ref, T) * T;
+        
+        if norm(N_un) < 1e-9
+            N = cross(T, [0, 0, 1]); % 极小概率平行的后备方案
         else
-            N = N_un / norm(N_un); % 归一化
+            N = N_un / norm(N_un);
         end
+        
+        B = cross(T, N); % 叉乘得到副法向
+        
         normals(i, :) = N;
-        
-        % 计算副法向矢量
-        binormals(i, :) = cross(T, N);
+        binormals(i, :) = B;
     end
-    
+
     if show_progress
         fprintf(' 完成\n');
     end
     
-    % 返回TNB数据
-    tnb_data = [tangents, normals, binormals];
+    full_path_data = [path_xyz, tangents, normals, binormals];
 end
 
 %% ==================== 主执行模块 ====================
